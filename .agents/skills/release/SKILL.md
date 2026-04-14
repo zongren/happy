@@ -31,7 +31,13 @@ Present these as options. Wait for the user to pick.
     Package:     packages/happy-cli
     npm name:    happy
     Registry:    https://registry.npmjs.org
-    Git tags:    v{version}
+    Git tags:    cli-{version}
+
+Tag namespace note:
+- CLI releases use `cli-X.Y.Z`
+- Native releases use `native-<runtime-version>`
+- OTA releases use `ota-<ota-version>`
+- Do not use a bare `vX.Y.Z` tag for Happy releases because multiple release streams coexist in this repo
 
 ### Step 2: Gather state
 
@@ -61,7 +67,13 @@ Suggest a sensible default based on the current state. For beta, the next prerel
 
 Present as options. Wait for confirmation.
 
-### Step 4: Build
+### Step 4: Version bump
+
+Edit `packages/happy-cli/package.json` directly — do NOT use `npm version` (it chokes on pnpm workspace protocol).
+
+IMPORTANT: do this **before** build/test for the CLI. The build imports `package.json` and bakes the version into the generated bundle. If you build first and bump later, `happy --version` can still report the old prerelease version even though npm metadata shows the new one.
+
+### Step 5: Build
 
 ```bash
 cd packages/happy-cli
@@ -70,7 +82,7 @@ pnpm --filter happy run build
 
 Report success/failure. Stop on failure.
 
-### Step 5: Test (unit only)
+### Step 6: Test (unit only)
 
 ```bash
 cd packages/happy-cli
@@ -78,12 +90,9 @@ pnpm --filter happy exec vitest run --project unit
 ```
 
 Integration tests are slow and flaky — skip them for releases. Unit tests are the gate.
+Expect the unit suite to take around a minute; `src/utils/serverConnectionErrors.test.ts` is particularly slow, so don't mistake a long run for a hang.
 
 Report results. If failures, ask the user whether to proceed or abort.
-
-### Step 6: Version bump
-
-Edit `packages/happy-cli/package.json` directly — do NOT use `npm version` (it chokes on pnpm workspace protocol).
 
 ### Step 7: Publish
 
@@ -102,21 +111,32 @@ npm view happy dist-tags
 ```
 
 Confirm the new version appears under the correct tag.
+If `latest` doesn't move immediately, wait 10-15 seconds and check again; npm tag propagation is not always instant.
 
 ### Step 9: Git tag + commit (latest only)
 
 For `latest` releases only:
 1. Commit the version bump: `Release version X.Y.Z`
-2. Tag: `git tag vX.Y.Z`
+2. Tag: `git tag cli-X.Y.Z`
 3. Push: `git push && git push --tags`
 
 For `beta` releases: ask the user if they want to commit the version bump or leave it uncommitted.
+
+If `git push` is rejected because `origin/main` advanced while releasing, fetch and rebase the release commit before retrying:
+```bash
+git fetch origin main
+git rebase --autostash origin/main
+git tag -f cli-X.Y.Z
+git push && git push --tags
+```
+
+Use `--autostash` when the worktree is dirty from unrelated local changes so those edits are preserved. Recreate the tag after rebase because the release commit hash changes.
 
 ### Step 10: GitHub Release (latest only)
 
 For `latest` releases, create a GitHub release:
 ```bash
-gh release create vX.Y.Z --generate-notes --title "vX.Y.Z"
+gh release create cli-X.Y.Z --generate-notes --title "cli-X.Y.Z"
 ```
 
 ### Step 11: Install + verify locally
@@ -128,6 +148,7 @@ happy daemon status
 ```
 
 Report the installed version and daemon status.
+The smoke check must confirm that `happy --version` matches the published version, not just npm metadata. If it reports the old version, rebuild after the version bump and cut a corrective patch release.
 
 ---
 

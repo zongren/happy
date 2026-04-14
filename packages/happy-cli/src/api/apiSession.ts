@@ -11,6 +11,7 @@ import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
+import { shouldReconnect } from '@/utils/lidState';
 import { type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
@@ -86,6 +87,7 @@ export class ApiSessionClient extends EventEmitter {
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
+    private reconnectInterval: NodeJS.Timeout | null = null;
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
         currentTurnId: null,
         uuidToProviderSubagent: new Map<string, string>(),
@@ -135,10 +137,7 @@ export class ApiSessionClient extends EventEmitter {
                 sessionId: this.sessionId
             },
             path: '/v1/updates',
-            reconnection: true,
-            reconnectionAttempts: Infinity,
-            reconnectionDelay: 1000,
-            reconnectionDelayMax: 5000,
+            reconnection: false,
             transports: ['websocket'],
             withCredentials: true,
             autoConnect: false
@@ -150,6 +149,10 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('connect', () => {
             logger.debug('Socket connected successfully');
+            if (this.reconnectInterval) {
+                clearInterval(this.reconnectInterval);
+                this.reconnectInterval = null;
+            }
             this.rpcHandlerManager.onSocketConnect(this.socket);
             this.receiveSync.invalidate();
         })
@@ -160,8 +163,9 @@ export class ApiSessionClient extends EventEmitter {
         })
 
         this.socket.on('disconnect', (reason) => {
-            logger.debug('[API] Socket disconnected:', reason);
+            logger.debug(`[API] Socket disconnected: ${reason}`);
             this.rpcHandlerManager.onSocketDisconnect();
+            this.startSmartReconnect();
         })
 
         this.socket.on('connect_error', (error) => {
@@ -321,7 +325,8 @@ export class ApiSessionClient extends EventEmitter {
         // then backfill older messages in subsequent batches.
         while (this.pendingOutbox.length > 0) {
             const batchSize = Math.min(this.pendingOutbox.length, ApiSessionClient.MAX_OUTBOX_BATCH_SIZE);
-            const batch = this.pendingOutbox.splice(-batchSize, batchSize);
+            const batchStart = this.pendingOutbox.length - batchSize;
+            const batch = this.pendingOutbox.slice(batchStart);
 
             const response = await axios.post<V3PostSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
@@ -339,6 +344,7 @@ export class ApiSessionClient extends EventEmitter {
                 message.seq > acc ? message.seq : acc
             ), this.lastSeq);
             this.lastSeq = maxSeq;
+            this.pendingOutbox.splice(batchStart, batch.length);
         }
     }
 
@@ -614,6 +620,32 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug('[API] socket.close() called');
         this.sendSync.stop();
         this.receiveSync.stop();
+        if (this.reconnectInterval) {
+            clearInterval(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
         this.socket.close();
+    }
+
+    private startSmartReconnect() {
+        if (this.reconnectInterval) return;
+
+        if (shouldReconnect()) {
+            logger.debug('[API] Network up + lid open — reconnecting in 1s');
+            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            return;
+        }
+
+        logger.debug('[API] Conditions not met for reconnect — polling every 5s');
+        this.reconnectInterval = setInterval(() => {
+            if (!shouldReconnect()) {
+                logger.debug('[API] Still not ready to reconnect');
+                return;
+            }
+            logger.debug('[API] Conditions met — reconnecting');
+            clearInterval(this.reconnectInterval!);
+            this.reconnectInterval = null;
+            this.socket.connect();
+        }, 5000);
     }
 }
